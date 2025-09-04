@@ -1,0 +1,53 @@
+---
+- name: Render DERP map files
+  when: headscale_derp_maps | length > 0
+  loop: "{{ headscale_derp_maps }}"
+  loop_control:
+    label: "{{ item.filename }}"
+  template:
+    src: "derp-map.yaml.j2"
+    dest: "{{ headscale_derp_paths_dir }}/{{ item.filename }}"
+    owner: "{{ headscale_user }}"
+    group: "{{ headscale_group }}"
+    mode: "0644"
+  vars:
+    derp_regions: "{{ item.derp_regions }}"
+  register: _derp_rendered
+
+- name: Collect DERP map paths
+  when: headscale_derp_maps | length > 0
+  set_fact:
+    headscale_derp_local_paths: >-
+      {{
+        _derp_rendered.results
+        | map(attribute='item.filename')
+        | map('regex_replace', '^', (headscale_derp_paths_dir | regex_replace('/+$','')) ~ '/')
+        | list
+      }}
+
+- name: Write Noise private key to file
+  copy:
+    content: "{{ headscale_noise_private_key }}"
+    dest: "{{ headscale_noise_private_key_path }}"
+    owner: "{{ headscale_user }}"
+    group: "{{ headscale_group }}"
+    mode: "0600"
+  when: headscale_noise_private_key | length > 0
+
+- name: Write DERP private key to file
+  copy:
+    content: "{{ headscale_derp_private_key }}"
+    dest: "{{ headscale_derp_private_key_path }}"
+    owner: "{{ headscale_user }}"
+    group: "{{ headscale_group }}"
+    mode: "0600"
+  when: headscale_derp_private_key | length > 0
+
+- name: Generate Headscale config
+  template:
+    src: headscale-config.yaml.j2
+    dest: "{{ headscale_config_file }}"
+    owner: "{{ headscale_user }}"
+    group: "{{ headscale_group }}"
+    mode: "0640"
+  notify: Restart headscale

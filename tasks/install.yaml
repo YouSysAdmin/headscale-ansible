@@ -1,0 +1,283 @@
+---
+- name: Resolve GitHub release
+  set_fact:
+    _release_api_url: >-
+      https://api.github.com/repos/juanfont/headscale/releases/{{
+        'latest' if headscale_version == 'latest' else 'tags/' + headscale_version
+      }}
+
+# Decide packaging strategy (DEB vs raw) early so it's always defined
+- name: Decide packaging strategy (deb vs raw)
+  set_fact:
+    _use_deb: "{{ (headscale_prefer_deb | default(false)) and (ansible_os_family | default('') in ['Debian']) }}"
+
+- name: Prepare GitHub headers
+  set_fact:
+    _github_headers: >-
+      {{
+        {'Accept': 'application/vnd.github+json', 'User-Agent': 'ansible-headscale-role'}
+        | combine(
+            {'Authorization': 'Bearer ' ~ headscale_github_token}
+            if (headscale_github_token | default('')) | length > 0
+            else {}
+          )
+      }}
+
+- name: Query GitHub release metadata
+  uri:
+    url: "{{ _release_api_url }}"
+    headers: "{{ _github_headers }}"
+    return_content: yes
+    follow_redirects: all
+    status_code: 200
+  register: gh
+  check_mode: no
+  changed_when: false
+
+# SAFE decoding sequence (no undefined accesses)
+- name: Capture GitHub JSON if provided by the uri module
+  set_fact:
+    gh_json: "{{ gh.json }}"
+  when:
+    - gh is defined
+    - gh.json is defined
+
+- name: Parse GitHub content as JSON when gh.json is missing
+  set_fact:
+    gh_json: "{{ gh.content | from_json }}"
+  when:
+    - gh_json is not defined
+    - gh is defined
+    - gh.content is defined
+    - (gh.content | string) | length > 0
+
+- name: Ensure gh_json is at least an empty dict
+  set_fact:
+    gh_json: {}
+  when: gh_json is not defined
+
+- name: Validate GitHub response shape
+  fail:
+    msg: >-
+      GitHub API error (status={{ gh.status | default('n/a') }}): {{
+        gh_json.message | default(gh.msg | default(gh.content | default('no content')))
+      }}
+  when:
+    - gh is not defined
+      or (gh.status | default(0)) != 200
+      or (gh_json.tag_name is not defined)
+      or (gh_json.assets is not defined)
+
+- name: Prepare variables from release
+  set_fact:
+    _tag_name: "{{ gh_json.tag_name }}"
+    _version_no_v: "{{ gh_json.tag_name | regex_replace('^v', '') }}"
+    _assets: "{{ gh_json.assets | default([]) }}"
+
+# Build a list of candidate asset names to be resilient to naming changes
+- name: Build candidate asset names
+  set_fact:
+    _candidate_asset_names: >-
+      {%- set names = [] -%}
+      {%- set base = 'headscale_' ~ _version_no_v ~ '_' ~ headscale_os ~ '_' ~ headscale_arch -%}
+      {# DEB package (linux only), when requested #}
+      {%- if _use_deb | bool -%}
+      {%-   set _ = names.append('headscale_' ~ _version_no_v ~ '_linux_' ~ headscale_arch ~ '.deb') -%}
+      {%- endif -%}
+      {# Raw binary (no extension) and tolerant archive variants #}
+      {%- set _ = names.append(base) -%}
+      {%- set _ = names.append(base ~ '.tar.gz') -%}
+      {%- set _ = names.append(base ~ '.zip') -%}
+      {{ names }}
+
+# First attempt: exact-name match against assets
+- name: Try exact match for asset
+  set_fact:
+    _asset_obj: "{{ (_assets | selectattr('name','in', _candidate_asset_names) | list | first) | default({}) }}"
+
+# Fallback attempt: regex match for asset (accept .deb/.tar.gz/.zip or no ext)
+- name: Try regex match for asset
+  set_fact:
+    _asset_obj: >-
+      {{
+        _asset_obj
+        if _asset_obj | length > 0 else
+        (
+          _assets | selectattr('name','search',
+            '^headscale_' ~ _version_no_v ~ '_' ~ headscale_os ~ '_' ~ headscale_arch ~ '(\\.(deb|tar\\.gz|zip))?$'
+          ) | list | first | default({})
+        )
+      }}
+
+- name: Validate that a suitable asset was found
+  fail:
+    msg: >-
+      Could not find a headscale asset for version {{ _tag_name }} with candidates
+      {{ _candidate_asset_names }}. Available assets were: {{ _assets | map(attribute='name') | list }}
+  when: _asset_obj | length == 0
+
+# Decide checksums and URLs once the asset object is picked
+- name: Set URLs for asset and checksums
+  set_fact:
+    _asset_name: "{{ _asset_obj.name }}"
+    _asset_url: "{{ _asset_obj.browser_download_url }}"
+    _checksums_name: "checksums.txt"
+    _checksums_url: >-
+      {{
+        (_assets | selectattr('name','equalto','checksums.txt')
+         | map(attribute='browser_download_url') | list | first) | default('')
+      }}
+  failed_when: _checksums_url == ''
+
+- name: Download checksums.txt
+  uri:
+    url: "{{ _checksums_url }}"
+    return_content: yes
+  register: checks
+  check_mode: no
+  changed_when: false
+
+- name: Parse expected SHA256 for the chosen asset (line select)
+  set_fact:
+    _checksum_line: "{{ checks.content.splitlines()
+      | select('search', '  ' ~ _asset_name | regex_escape ~ '$')
+      | list | first | default('') }}"
+  failed_when: _checksum_line == ''
+
+- name: Extract SHA256 from checksum line
+  set_fact:
+    _asset_sha256: "{{ _checksum_line.split()[0] | lower }}"
+  failed_when: _asset_sha256 is not match('^[a-f0-9]{64}$')
+
+- name: Determine if asset is an archive
+  set_fact:
+    _is_archive: "{{ _asset_name is match('.*\\.(tar\\.gz|zip)$') }}"
+
+- name: Download headscale artifact
+  get_url:
+    url: "{{ _asset_url }}"
+    dest: "/tmp/{{ _asset_name }}"
+    mode: "0644"
+    checksum: "sha256:{{ _asset_sha256 }}"
+  when: not ansible_check_mode
+
+- name: Install headscale
+  block:
+    - name: Install DEB via apt
+      apt:
+        deb: "/tmp/{{ _asset_name }}"
+      when:
+        - (_use_deb | default(false)) | bool
+        - not ansible_check_mode
+
+    - name: Ensure install dir exists (raw binary)
+      file:
+        path: "{{ headscale_install_dir }}"
+        state: directory
+        mode: "0755"
+      when:
+        - not (_use_deb | default(false) | bool)
+        - not ansible_check_mode
+
+    # Raw install path when asset is a single binary
+    - name: Install raw binary (direct)
+      copy:
+        src: "/tmp/{{ _asset_name }}"
+        dest: "{{ headscale_install_dir }}/{{ headscale_binary_name }}"
+        mode: "0755"
+        remote_src: true
+      when:
+        - not (_use_deb | default(false) | bool)
+        - not (_is_archive | bool)
+        - not ansible_check_mode
+
+    # Handle archives: extract and place 'headscale' binary
+    - name: Create temp dir for archive extraction
+      tempfile:
+        state: directory
+        suffix: headscale
+      register: _hs_tmp
+      when:
+        - not (_use_deb | default(false) | bool)
+        - (_is_archive | bool)
+        - not ansible_check_mode
+
+    - name: Unarchive asset
+      unarchive:
+        src: "/tmp/{{ _asset_name }}"
+        dest: "{{ _hs_tmp.path }}"
+        remote_src: true
+      when:
+        - not (_use_deb | default(false) | bool)
+        - (_is_archive | bool)
+        - not ansible_check_mode
+
+    - name: Find extracted headscale binary
+      find:
+        paths: "{{ _hs_tmp.path }}"
+        patterns: "headscale"
+        file_type: file
+      register: _hs_found
+      when:
+        - not (_use_deb | default(false) | bool)
+        - (_is_archive | bool)
+        - not ansible_check_mode
+
+    - name: Fail if headscale binary not found in archive
+      fail:
+        msg: >-
+          Extracted archive did not contain a 'headscale' binary.
+          Extracted files: {{ _hs_found.files | map(attribute='path') | list | default([]) }}
+      when:
+        - not (_use_deb | default(false) | bool)
+        - (_is_archive | bool)
+        - not ansible_check_mode
+        - (_hs_found.matched | default(0)) | int == 0
+
+    - name: Install headscale binary from archive
+      copy:
+        src: "{{ (_hs_found.files | map(attribute='path') | list)[0] }}"
+        dest: "{{ headscale_install_dir }}/{{ headscale_binary_name }}"
+        mode: "0755"
+        remote_src: true
+      when:
+        - not (_use_deb | default(false) | bool)
+        - (_is_archive | bool)
+        - not ansible_check_mode
+
+  always:
+    - name: Remove downloaded artifact
+      file:
+        path: "/tmp/{{ _asset_name }}"
+        state: absent
+      when: not ansible_check_mode
+
+    - name: Remove temp dir (if created)
+      file:
+        path: "{{ _hs_tmp.path }}"
+        state: absent
+      when:
+        - _hs_tmp is defined
+        - _hs_tmp.path is defined
+        - not ansible_check_mode
+
+- name: Compute binary path for version check
+  set_fact:
+    headscale_bin_path: >-
+      {{ (_use_deb | default(false) | bool)
+         | ternary('/usr/bin/' ~ headscale_binary_name,
+                   headscale_install_dir ~ '/' ~ headscale_binary_name) }}
+
+- name: Get installed version
+  command: "{{ headscale_bin_path }} version"
+  register: ver
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Show result
+  debug:
+    msg:
+      - "Planned install (check mode={{ ansible_check_mode }}) for headscale {{ _tag_name }} ({{ _asset_name }})"
+      - "Binary path: {{ headscale_bin_path }}"
+      - "{{ (not ansible_check_mode) | ternary('headscale version output: ' ~ (ver.stdout | default('n/a')), 'headscale version skipped in check mode') }}"

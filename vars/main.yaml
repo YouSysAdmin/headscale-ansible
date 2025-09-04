@@ -1,0 +1,20 @@
+---
+_os_map:
+  Linux: linux
+  Darwin: darwin
+  Windows: windows
+
+_arch_map:
+  i386: "386"
+  x86_64: amd64
+  amd64: amd64
+  aarch64: arm64
+  arm64: arm64
+  armv7l: armv7
+  armv7: armv7
+  armv6l: armv6
+  armv6: armv6
+
+headscale_arch: "{{ _arch_map.get(ansible_architecture, ansible_architecture) }}"
+headscale_os: "{{ _os_map.get(ansible_system, (ansible_system | default('Linux')) | lower) }}"
+

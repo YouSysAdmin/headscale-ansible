@@ -1,0 +1,15 @@
+---
+galaxy_info:
+  role_name: headscale
+  author: YouSysAdmin
+  description: Install Headscale
+  company: YouSysAdmin
+
+  license: MIT
+
+  min_ansible_version: 2.4
+
+  galaxy_tags:
+    - headscale
+
+dependencies: []

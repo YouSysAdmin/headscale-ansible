@@ -1,0 +1,17 @@
+---
+- name: Deploy systemd service unit
+  template:
+    src: headscale.service.j2
+    dest: /etc/systemd/system/headscale.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart headscale
+
+- name: Enable and start headscale service
+  systemd:
+    name: headscale
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: not ansible_check_mode

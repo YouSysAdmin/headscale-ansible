@@ -1,0 +1,44 @@
+---
+- name: Ensure headscale group exists
+  ansible.builtin.group:
+    name: "{{ headscale_group }}"
+    system: yes
+  when: headscale_group != "root"
+
+- name: Ensure headscale user exists
+  ansible.builtin.user:
+    name: "{{ headscale_user }}"
+    group: "{{ headscale_group }}"
+    create_home: no
+    system: yes
+    shell: "/sbin/nologin"
+  when: headscale_user != "root"
+
+- name: Ensure config directory exists
+  file:
+    path: "{{ headscale_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure DERP maps directory exists
+  file:
+    path: "{{ headscale_derp_paths_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure work/state directory exists
+  file:
+    path: "{{ headscale_workdir }}"
+    state: directory
+    owner: "{{ headscale_user }}"
+    group: "{{ headscale_group }}"
+    mode: "0750"
+
+- import_tasks: install.yaml     # download & install headscale
+- import_tasks: config.yaml      # render headscale-config.yaml
+- import_tasks: systemd.yaml     # service unit & start (already checks config path)
+
