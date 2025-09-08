@@ -296,7 +296,7 @@ dns:
   extra_records_path: {{ headscale_dns_extra_records_path | default("")}}
 
 unix_socket: {{ headscale_unix_socket }}
-unix_socket_permission: {{ headscale_unix_socket_permission }}
+unix_socket_permission: {{ headscale_unix_socket_permission | to_json }}
 
 {% if headscale_oidc_enabled | bool %}
 oidc:
